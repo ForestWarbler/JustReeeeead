@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload, for example v0.0.1."
+        required: true
+        default: "v0.0.1"
+  push:
+    tags:
+      - "v*"
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build-tauri:
+    name: Build ${{ matrix.name }}
+    permissions:
+      contents: write
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            rust-target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          - name: macOS Intel
+            platform: macos-latest
+            rust-target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+          - name: Linux x64
+            platform: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            args: ""
+          - name: Windows x64
+            platform: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            args: ""
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2 \
+            rpm \
+            pkg-config
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check frontend
+        run: npm run check
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Test Rust core
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Read release notes
+        id: release_notes
+        shell: bash
+        run: |
+          {
+            echo 'body<<EOF'
+            if [ -f RELEASE_NOTES.md ]; then
+              cat RELEASE_NOTES.md
+            else
+              echo "See the assets below to download this release."
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and upload release assets
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "JustReeeeead ${{ env.RELEASE_TAG }}"
+          releaseBody: ${{ steps.release_notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          releaseAssetNamePattern: "[name]_[version]_[platform]_[arch][setup][ext]"
+          uploadUpdaterJson: false
+          args: ${{ matrix.args }}

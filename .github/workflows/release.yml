@@ -12,6 +12,7 @@ on:
       - "v*"
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
@@ -114,6 +115,6 @@ jobs:
           releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
-          releaseAssetNamePattern: "[name]_[version]_[platform]_[arch][setup][ext]"
-          uploadUpdaterJson: false
+          assetNamePattern: "[name]_[version]_[platform]_[arch][setup][ext]"
+          includeUpdaterJson: false
           args: ${{ matrix.args }}

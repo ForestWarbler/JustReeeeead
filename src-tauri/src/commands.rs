@@ -125,6 +125,15 @@ pub fn remove_library_document(app: AppHandle, doc_id: String) -> CommandResult<
     library::remove_library_document(&app, &doc_id).map_err(command_error)
 }
 
+#[tauri::command]
+pub fn move_library_document(
+    app: AppHandle,
+    doc_id: String,
+    folder_id: Option<String>,
+) -> CommandResult<LibraryData> {
+    library::move_library_document(&app, &doc_id, folder_id).map_err(command_error)
+}
+
 fn command_error(error: anyhow::Error) -> String {
     error.to_string()
 }

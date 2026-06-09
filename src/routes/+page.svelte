@@ -81,6 +81,12 @@
     height: number;
   }
 
+  type WindowFileDropEvent =
+    | { type: "enter"; paths: string[] }
+    | { type: "over" }
+    | { type: "drop"; paths: string[] }
+    | { type: "leave" };
+
   let settings = $state<AppSettings | null>(null);
   let documentInfo = $state<PdfDocumentInfo | null>(null);
   let viewport = $state<HTMLDivElement | null>(null);
@@ -100,6 +106,9 @@
   let sidebarOpen = $state(false);
   let sidebarWidth = $state(260);
   let isResizingSidebar = false;
+  let recentRefreshToken = $state(0);
+  let isFileDropActive = $state(false);
+  let fileDropMessage = $state("Drop PDF to open");
   let apiKeyInput = $state("");
   let settingsOpen = $state(false);
   let errorMessage = $state("");
@@ -243,6 +252,17 @@
     const cleanup: Array<() => void> = [];
 
     void (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        cleanup.push(
+          await getCurrentWindow().onDragDropEvent((event) => {
+            void handleWindowFileDrop(event.payload as WindowFileDropEvent);
+          }),
+        );
+      } catch {
+        // Drag-drop events are only available inside the Tauri runtime.
+      }
+
       try {
         settings = await getSettings();
         displayZoom = settings?.reader.zoom ?? 1;
@@ -452,6 +472,7 @@
       await cancelTranslation(translation.jobId);
     }
     documentInfo = await openPdf(path);
+    recentRefreshToken += 1;
     renderUrls = {};
     lastRenderUrls = {};
     textLayers = {};
@@ -520,6 +541,36 @@
     } catch (error) {
       errorMessage = stringifyError(error);
     }
+  }
+
+  async function handleWindowFileDrop(event: WindowFileDropEvent) {
+    if (event.type === "leave") {
+      isFileDropActive = false;
+      return;
+    }
+
+    if (event.type === "enter") {
+      isFileDropActive = true;
+      fileDropMessage = pdfPathFromDrop(event.paths) ? "Drop PDF to open" : "Only PDF files can be opened";
+      return;
+    }
+
+    if (event.type === "over") {
+      isFileDropActive = true;
+      return;
+    }
+
+    isFileDropActive = false;
+    const pdfPath = pdfPathFromDrop(event.paths);
+    if (!pdfPath) {
+      errorMessage = "Only PDF files can be opened.";
+      return;
+    }
+    await openPdfByPath(pdfPath);
+  }
+
+  function pdfPathFromDrop(paths: string[]): string | null {
+    return paths.find((path) => path.toLowerCase().endsWith(".pdf")) ?? null;
   }
 
   function onViewportScroll() {
@@ -1364,10 +1415,19 @@
     </section>
   {/if}
 
+  {#if isFileDropActive}
+    <div class="file-drop-overlay" aria-hidden="true">
+      <div>
+        <FolderOpen size={24} />
+        <strong>{fileDropMessage}</strong>
+      </div>
+    </div>
+  {/if}
+
   <section class="workspace">
     {#if sidebarOpen}
       <div class="sidebar-container">
-        <Sidebar {documentInfo} onOpenDocument={openPdfByPath} />
+        <Sidebar {documentInfo} {recentRefreshToken} onOpenDocument={openPdfByPath} />
         <div
           class="sidebar-resizer"
           role="separator"
@@ -1567,6 +1627,7 @@
     --danger-border: #efb8aa;
     --danger-text: #963f2c;
     display: grid;
+    position: relative;
     grid-template-rows: 52px auto 1fr;
     width: 100vw;
     height: 100vh;
@@ -1768,6 +1829,33 @@
     grid-template-columns: minmax(0, 1fr) var(--panel-size);
     min-height: 0;
     min-width: 0;
+  }
+
+  .file-drop-overlay {
+    position: absolute;
+    inset: 52px 0 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--reader-bg) 78%, transparent);
+    pointer-events: none;
+  }
+
+  .file-drop-overlay > div {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: var(--surface-raised);
+    color: var(--accent);
+    box-shadow: var(--shadow);
+  }
+
+  .file-drop-overlay strong {
+    font-size: 16px;
+    font-weight: 650;
   }
 
   main.sidebar-open .workspace {

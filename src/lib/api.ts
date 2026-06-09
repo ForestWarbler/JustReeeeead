@@ -79,3 +79,7 @@ export function addLibraryDocument(
 export function removeLibraryDocument(docId: string): Promise<LibraryData> {
   return invoke("remove_library_document", { docId });
 }
+
+export function moveLibraryDocument(docId: string, folderId: string | null): Promise<LibraryData> {
+  return invoke("move_library_document", { docId, folderId });
+}

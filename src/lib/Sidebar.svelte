@@ -18,18 +18,28 @@
     removeLibraryFolder,
     addLibraryDocument,
     removeLibraryDocument,
+    moveLibraryDocument,
     getRecentFiles,
     openPdf,
     closePdf,
   } from "$lib/api";
-  import type { LibraryData, LibraryFolder, LibraryDocument, PdfDocumentInfo, RecentFileEntry, PdfOutlineItem } from "$lib/types";
+  import type { LibraryData, LibraryDocument, PdfDocumentInfo, RecentFileEntry, PdfOutlineItem } from "$lib/types";
 
   interface Props {
     onOpenDocument: (path: string) => Promise<void>;
     documentInfo: PdfDocumentInfo | null;
+    recentRefreshToken: number;
   }
 
-  let { onOpenDocument, documentInfo }: Props = $props();
+  let { onOpenDocument, documentInfo, recentRefreshToken }: Props = $props();
+
+  type DragPayload =
+    | { kind: "recent"; path: string; title: string }
+    | { kind: "library"; docId: string };
+
+  type DropTarget = "root" | string | null;
+
+  const DOCUMENT_DRAG_MIME = "application/x-justreeeead-document";
 
   let libraryData = $state<LibraryData>({ folders: [], documents: [] });
   let recentFiles = $state<RecentFileEntry[]>([]);
@@ -38,6 +48,9 @@
   let selectedFolderId = $state<string | null>(null);
   let selectedDocId = $state<string | null>(null);
   let errorMessage = $state("");
+  let dropTarget = $state<DropTarget>(null);
+  let draggedDocumentId = $state<string | null>(null);
+  let activeDragPayload = $state<DragPayload | null>(null);
 
   let foldersExpanded = $state(true);
   let recentExpanded = $state(true);
@@ -46,6 +59,11 @@
   onMount(() => {
     loadLibrary();
     loadRecentFiles();
+  });
+
+  $effect(() => {
+    void recentRefreshToken;
+    void loadRecentFiles();
   });
 
   async function loadLibrary() {
@@ -130,6 +148,136 @@
 
   async function handleOpenRecent(file: RecentFileEntry) {
     await onOpenDocument(file.path);
+  }
+
+  function startRecentDrag(event: DragEvent, file: RecentFileEntry) {
+    const payload: DragPayload = {
+      kind: "recent",
+      path: file.path,
+      title: file.title,
+    };
+    activeDragPayload = payload;
+    setDragPayload(event, payload);
+  }
+
+  function startLibraryDrag(event: DragEvent, doc: LibraryDocument) {
+    const payload: DragPayload = {
+      kind: "library",
+      docId: doc.id,
+    };
+    draggedDocumentId = doc.id;
+    activeDragPayload = payload;
+    setDragPayload(event, payload);
+  }
+
+  function finishDocumentDrag() {
+    draggedDocumentId = null;
+    activeDragPayload = null;
+    dropTarget = null;
+  }
+
+  function setDragPayload(event: DragEvent, payload: DragPayload) {
+    if (!event.dataTransfer) {
+      return;
+    }
+    const serialized = JSON.stringify(payload);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData(DOCUMENT_DRAG_MIME, serialized);
+    event.dataTransfer.setData("text/plain", serialized);
+  }
+
+  function readDragPayload(event: DragEvent): DragPayload | null {
+    const raw =
+      event.dataTransfer?.getData(DOCUMENT_DRAG_MIME) ||
+      event.dataTransfer?.getData("text/plain") ||
+      "";
+    if (!raw) {
+      return activeDragPayload;
+    }
+    try {
+      const parsed = JSON.parse(raw) as DragPayload;
+      if (parsed.kind === "recent" && parsed.path) {
+        return parsed;
+      }
+      if (parsed.kind === "library" && parsed.docId) {
+        return parsed;
+      }
+    } catch {
+      return activeDragPayload;
+    }
+    return activeDragPayload;
+  }
+
+  function allowLibraryDrop(event: DragEvent, target: DropTarget) {
+    const payload = activeDragPayload ?? readDragPayload(event);
+    if (!payload || (payload.kind === "library" && libraryDocumentFolderId(payload.docId) === targetFolderId(target))) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    dropTarget = target;
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "move";
+    }
+  }
+
+  function leaveLibraryDrop(event: DragEvent, target: DropTarget) {
+    if (dropTarget === target && event.currentTarget instanceof Element) {
+      const nextTarget = event.relatedTarget;
+      if (!nextTarget || !(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+        dropTarget = null;
+      }
+    }
+  }
+
+  async function dropDocument(event: DragEvent, target: DropTarget) {
+    const payload = readDragPayload(event);
+    if (!payload) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    dropTarget = null;
+
+    const folderId = targetFolderId(target);
+    try {
+      if (payload.kind === "recent") {
+        await addRecentToLibrary(payload, folderId);
+      } else {
+        libraryData = await moveLibraryDocument(payload.docId, folderId);
+      }
+      if (folderId) {
+        selectedFolderId = folderId;
+      }
+    } catch (e) {
+      errorMessage = String(e);
+    } finally {
+      finishDocumentDrag();
+    }
+  }
+
+  async function addRecentToLibrary(file: Extract<DragPayload, { kind: "recent" }>, folderId: string | null) {
+    const info = await openPdf(file.path);
+    try {
+      libraryData = await addLibraryDocument(
+        info.path,
+        info.title || file.title,
+        info.fileHash,
+        folderId,
+      );
+    } finally {
+      await closePdf(info.docId);
+      await loadRecentFiles();
+    }
+  }
+
+  function targetFolderId(target: DropTarget): string | null {
+    return target === "root" ? null : target;
+  }
+
+  function libraryDocumentFolderId(docId: string): string | null {
+    return libraryData.documents.find((document) => document.id === docId)?.folderId ?? null;
   }
 
   function flattenOutline(
@@ -245,8 +393,11 @@
             <div
               class="doc-item"
               class:active={isDocumentActive(file.path)}
+              draggable="true"
               role="button"
               tabindex="0"
+              ondragstart={(event) => startRecentDrag(event, file)}
+              ondragend={finishDocumentDrag}
               onclick={() => handleOpenRecent(file)}
               onkeydown={(e) => e.key === 'Enter' && handleOpenRecent(file)}
               title={file.path}
@@ -262,7 +413,15 @@
 
   <!-- Library -->
   <div class="sidebar-section">
-    <div class="sidebar-section-header-row">
+    <div
+      class="sidebar-section-header-row library-drop-target"
+      class:drop-active={dropTarget === "root"}
+      role="group"
+      aria-label="Library root"
+      ondragover={(event) => allowLibraryDrop(event, "root")}
+      ondragleave={(event) => leaveLibraryDrop(event, "root")}
+      ondrop={(event) => dropDocument(event, "root")}
+    >
       <button class="sidebar-section-header" onclick={() => (foldersExpanded = !foldersExpanded)}>
         <span class="chevron" class:rotated={foldersExpanded}><ChevronRight size={12} /></span>
         <Library size={14} />
@@ -294,23 +453,37 @@
 
     {#if foldersExpanded}
       <!-- Root documents -->
-      {#each rootDocuments() as doc (doc.id)}
-        <div
-          class="doc-item"
-          class:active={isDocumentActive(doc.path)}
-          role="button"
-          tabindex="0"
-          onclick={() => handleOpenLibraryDocument(doc)}
-          onkeydown={(e) => e.key === 'Enter' && handleOpenLibraryDocument(doc)}
-          title={doc.path}
-        >
-          <FileText size={13} />
-          <span>{truncate(doc.title, 40)}</span>
-          <button class="icon-btn-sm delete-btn" onclick={(e) => { e.stopPropagation(); handleRemoveDocument(doc.id); }}>
-            <Trash2 size={12} />
-          </button>
-        </div>
-      {/each}
+      <div
+        class="root-docs library-drop-target"
+        class:drop-active={dropTarget === "root"}
+        role="list"
+        aria-label="Root library documents"
+        ondragover={(event) => allowLibraryDrop(event, "root")}
+        ondragleave={(event) => leaveLibraryDrop(event, "root")}
+        ondrop={(event) => dropDocument(event, "root")}
+      >
+        {#each rootDocuments() as doc (doc.id)}
+          <div
+            class="doc-item"
+            class:active={isDocumentActive(doc.path)}
+            class:dragging={draggedDocumentId === doc.id}
+            draggable="true"
+            role="button"
+            tabindex="0"
+            ondragstart={(event) => startLibraryDrag(event, doc)}
+            ondragend={finishDocumentDrag}
+            onclick={() => handleOpenLibraryDocument(doc)}
+            onkeydown={(e) => e.key === 'Enter' && handleOpenLibraryDocument(doc)}
+            title={doc.path}
+          >
+            <FileText size={13} />
+            <span>{truncate(doc.title, 40)}</span>
+            <button class="icon-btn-sm delete-btn" onclick={(e) => { e.stopPropagation(); handleRemoveDocument(doc.id); }}>
+              <Trash2 size={12} />
+            </button>
+          </div>
+        {/each}
+      </div>
 
       <!-- Folders -->
       {#each libraryData.folders as folder (folder.id)}
@@ -318,8 +491,12 @@
           <div
             class="folder-header"
             class:selected={selectedFolderId === folder.id}
+            class:drop-active={dropTarget === folder.id}
             role="button"
             tabindex="0"
+            ondragover={(event) => allowLibraryDrop(event, folder.id)}
+            ondragleave={(event) => leaveLibraryDrop(event, folder.id)}
+            ondrop={(event) => dropDocument(event, folder.id)}
             onclick={() => selectedFolderId = selectedFolderId === folder.id ? null : folder.id}
             onkeydown={(e) => e.key === 'Enter' && (selectedFolderId = selectedFolderId === folder.id ? null : folder.id)}
           >
@@ -332,7 +509,15 @@
             </button>
           </div>
           {#if selectedFolderId === folder.id}
-            <div class="folder-docs">
+            <div
+              class="folder-docs library-drop-target"
+              class:drop-active={dropTarget === folder.id}
+              role="list"
+              aria-label={`${folder.name} documents`}
+              ondragover={(event) => allowLibraryDrop(event, folder.id)}
+              ondragleave={(event) => leaveLibraryDrop(event, folder.id)}
+              ondrop={(event) => dropDocument(event, folder.id)}
+            >
               <button class="add-to-folder-btn" onclick={() => handleAddDocument(folder.id)}>
                 <Plus size={12} /> Add PDF
               </button>
@@ -340,8 +525,12 @@
                 <div
                   class="doc-item nested"
                   class:active={isDocumentActive(doc.path)}
+                  class:dragging={draggedDocumentId === doc.id}
+                  draggable="true"
                   role="button"
                   tabindex="0"
+                  ondragstart={(event) => startLibraryDrag(event, doc)}
+                  ondragend={finishDocumentDrag}
                   onclick={() => handleOpenLibraryDocument(doc)}
                   onkeydown={(e) => e.key === 'Enter' && handleOpenLibraryDocument(doc)}
                   title={doc.path}
@@ -424,6 +613,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    border-radius: 7px;
   }
 
   .section-actions {
@@ -526,6 +716,21 @@
     border-left: 1px solid var(--border);
   }
 
+  .root-docs {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-height: 8px;
+    border-radius: 7px;
+  }
+
+  .library-drop-target.drop-active,
+  .folder-header.drop-active {
+    background: var(--accent-soft);
+    outline: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+    outline-offset: -1px;
+  }
+
   .add-to-folder-btn {
     display: flex;
     align-items: center;
@@ -565,6 +770,10 @@
 
   .doc-item:hover {
     background: var(--surface-muted);
+  }
+
+  .doc-item.dragging {
+    opacity: 0.45;
   }
 
   .doc-item.active {

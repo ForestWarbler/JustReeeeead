@@ -78,6 +78,7 @@ pub fn run() {
             commands::remove_library_folder,
             commands::add_library_document,
             commands::remove_library_document,
+            commands::move_library_document,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -148,6 +148,31 @@ pub fn remove_library_document(app: &AppHandle, doc_id: &str) -> anyhow::Result<
     Ok(library)
 }
 
+pub fn move_library_document(
+    app: &AppHandle,
+    doc_id: &str,
+    folder_id: Option<String>,
+) -> anyhow::Result<LibraryData> {
+    let mut library = load_library(app)?;
+
+    if let Some(target_folder_id) = folder_id.as_deref() {
+        let folder_exists = library.folders.iter().any(|folder| folder.id == target_folder_id);
+        if !folder_exists {
+            anyhow::bail!("Target folder does not exist");
+        }
+    }
+
+    let document = library
+        .documents
+        .iter_mut()
+        .find(|document| document.id == doc_id)
+        .ok_or_else(|| anyhow::anyhow!("Library document does not exist"))?;
+    document.folder_id = folder_id;
+
+    save_library(app, &library)?;
+    Ok(library)
+}
+
 fn library_path(app: &AppHandle) -> anyhow::Result<PathBuf> {
     let dir = app.path().app_config_dir()?;
     fs::create_dir_all(&dir)?;

@@ -1,16 +1,16 @@
-# JustReeeeead v0.0.2
+# JustReeeeead v0.0.3
 
-This release adds drag-and-drop document workflows on top of the initial paper-reading MVP.
+This release adds fast in-document PDF search for paper reading.
 
 ## Highlights
 
-- Drop a PDF file into the desktop window to open it immediately.
-- Drag documents from Recent into the Library root or a specific folder.
-- Drag Library documents between folders, or back to the Library root.
-- Persist Library document folder changes through the native Rust core.
-- Refresh Recent documents after opening dropped or sidebar-selected PDFs.
+- Press Ctrl+F or Command+F to open a lightweight search box in the reader.
+- Search is case-insensitive and collapses PDF line-break whitespace for phrase matches.
+- Navigate matches with Enter, Shift+Enter, or the previous/next buttons.
+- Highlight all visible matches and emphasize the active result while preserving smooth scrolling.
+- Reuse cached PDF text layers so search avoids re-parsing page content when possible.
 
 ## Notes
 
-- Existing v0.0.1 functionality remains focused on local PDF reading and AI-assisted translation.
+- Existing PDF reading, library, drag-and-drop, and AI-assisted translation workflows remain unchanged.
 - macOS/Linux/Windows release assets are built by the GitHub Actions release workflow.

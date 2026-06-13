@@ -4,6 +4,8 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import {
     Bot,
+    ChevronDown,
+    ChevronUp,
     Dock,
     FolderOpen,
     KeyRound,
@@ -17,9 +19,11 @@
     RefreshCw,
     RotateCw,
     Save,
+    Search as SearchIcon,
     Settings as SettingsIcon,
     Square,
     Sun,
+    X,
     ZoomIn,
     ZoomOut,
   } from "@lucide/svelte";
@@ -51,6 +55,13 @@
     finishTranslation,
   } from "$lib/translationState";
   import { backgroundTranslation } from "$lib/backgroundTranslation";
+  import {
+    buildSearchPageIndex,
+    findSearchMatches,
+    normalizeSearchQuery,
+    type SearchMatch,
+    type SearchPageIndex,
+  } from "$lib/search";
   import Sidebar from "$lib/Sidebar.svelte";
   import type {
     AppSettings,
@@ -124,6 +135,16 @@
   let lastSelectionKey = "";
   let activeTranslationCacheInput: SelectionTranslationCacheInput | null = null;
   let gestureStartZoom = 1;
+  let searchOpen = $state(false);
+  let searchInputElement = $state<HTMLInputElement | null>(null);
+  let searchQuery = $state("");
+  let searchIndexes = $state<Record<number, SearchPageIndex>>({});
+  let searchMatches = $state<SearchMatch[]>([]);
+  let searchActiveIndex = $state(-1);
+  let searchLoading = $state(false);
+  let searchIndexedPages = $state(0);
+  let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchRunId = 0;
 
   const loadingRenderUrls = new Set<string>();
   const queuedPrefetchKeys = new Set<string>();
@@ -219,6 +240,33 @@
       return 0;
     }
     return Math.min(...viewportPageIndexes) + 1;
+  });
+
+  const activeSearchMatchId = $derived.by(() => {
+    return searchActiveIndex >= 0 ? searchMatches[searchActiveIndex]?.id ?? "" : "";
+  });
+
+  const searchMatchesByPage = $derived.by(() => {
+    const byPage: Record<number, SearchMatch[]> = {};
+    for (const match of searchMatches) {
+      byPage[match.pageIndex] = [...(byPage[match.pageIndex] ?? []), match];
+    }
+    return byPage;
+  });
+
+  const searchStatusText = $derived.by(() => {
+    if (!normalizeSearchQuery(searchQuery)) {
+      return "";
+    }
+    if (searchLoading) {
+      return searchMatches.length > 0
+        ? `${Math.max(1, searchActiveIndex + 1)} / ${searchMatches.length}+`
+        : `Searching ${searchIndexedPages} / ${documentInfo?.pageCount ?? 0}`;
+    }
+    if (searchMatches.length === 0) {
+      return "No results";
+    }
+    return `${searchActiveIndex + 1} / ${searchMatches.length}`;
   });
 
   $effect(() => {
@@ -323,6 +371,7 @@
       clearTranslateTimer();
       clearReaderSaveTimer();
       clearBackgroundStartTimer();
+      clearSearchTimer();
       cancelSelectionHighlightRefresh();
       if (zoomStableTimer) {
         clearTimeout(zoomStableTimer);
@@ -476,6 +525,7 @@
     renderUrls = {};
     lastRenderUrls = {};
     textLayers = {};
+    resetSearchState();
     queuedPrefetchKeys.clear();
     loadingRenderUrls.clear();
     loadingTextLayers.clear();
@@ -735,6 +785,12 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      void openSearch();
+      return;
+    }
+
     if (!(event.metaKey || event.ctrlKey) || isEditableTarget(event.target)) {
       return;
     }
@@ -776,6 +832,185 @@
   function isEditableTarget(target: EventTarget | null): boolean {
     const element = nodeElement(target);
     return Boolean(element?.closest("input, textarea, select, [contenteditable='true']"));
+  }
+
+  async function openSearch() {
+    if (!documentInfo) {
+      return;
+    }
+
+    searchOpen = true;
+    await tick();
+    searchInputElement?.focus();
+    searchInputElement?.select();
+    if (normalizeSearchQuery(searchQuery)) {
+      scheduleSearch();
+    }
+  }
+
+  function closeSearch() {
+    searchOpen = false;
+    searchMatches = [];
+    searchActiveIndex = -1;
+    searchLoading = false;
+    clearSearchTimer();
+    searchRunId += 1;
+  }
+
+  function resetSearchState() {
+    searchRunId += 1;
+    clearSearchTimer();
+    searchOpen = false;
+    searchQuery = "";
+    searchIndexes = {};
+    searchMatches = [];
+    searchActiveIndex = -1;
+    searchLoading = false;
+    searchIndexedPages = 0;
+  }
+
+  function updateSearchQuery(value: string) {
+    searchQuery = value;
+    scheduleSearch();
+  }
+
+  function scheduleSearch() {
+    clearSearchTimer();
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = null;
+      void runSearch();
+    }, 120);
+  }
+
+  function clearSearchTimer() {
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = null;
+    }
+  }
+
+  async function runSearch() {
+    const query = normalizeSearchQuery(searchQuery);
+    if (!documentInfo || !query) {
+      searchRunId += 1;
+      searchMatches = [];
+      searchActiveIndex = -1;
+      searchLoading = false;
+      searchIndexedPages = 0;
+      return;
+    }
+
+    const runId = searchRunId + 1;
+    searchRunId = runId;
+    searchLoading = true;
+    searchIndexedPages = 0;
+    searchMatches = [];
+    searchActiveIndex = -1;
+
+    const doc = documentInfo;
+    const matches: SearchMatch[] = [];
+    for (let pageIndex = 0; pageIndex < doc.pageCount; pageIndex += 1) {
+      if (searchRunId !== runId || documentInfo?.docId !== doc.docId) {
+        return;
+      }
+
+      try {
+        const index = await ensureSearchPageIndex(doc.docId, pageIndex, runId);
+        if (!index) {
+          continue;
+        }
+        matches.push(...findSearchMatches(index, query));
+        searchMatches = [...matches];
+        searchActiveIndex = matches.length > 0 ? 0 : -1;
+      } catch (error) {
+        errorMessage = stringifyError(error);
+      } finally {
+        searchIndexedPages += 1;
+      }
+
+      if (pageIndex % 4 === 3) {
+        await tick();
+      }
+    }
+
+    if (searchRunId !== runId || documentInfo?.docId !== doc.docId) {
+      return;
+    }
+
+    searchLoading = false;
+    searchMatches = matches;
+    searchActiveIndex = matches.length > 0 ? 0 : -1;
+    if (matches.length > 0) {
+      scrollToSearchMatch(matches[0], "auto");
+    }
+  }
+
+  async function ensureSearchPageIndex(docId: string, pageIndex: number, runId: number): Promise<SearchPageIndex | null> {
+    const cached = searchIndexes[pageIndex];
+    if (cached) {
+      return cached;
+    }
+
+    let layer = textLayers[pageIndex];
+    if (!layer) {
+      layer = await getPageTextLayer(docId, pageIndex);
+      if (searchRunId !== runId || documentInfo?.docId !== docId) {
+        return null;
+      }
+      textLayers = { ...textLayers, [pageIndex]: layer };
+    }
+
+    const index = buildSearchPageIndex(layer);
+    if (searchRunId !== runId || documentInfo?.docId !== docId) {
+      return null;
+    }
+    searchIndexes = { ...searchIndexes, [pageIndex]: index };
+    return index;
+  }
+
+  function moveSearch(delta: number) {
+    if (searchMatches.length === 0) {
+      return;
+    }
+
+    const nextIndex = (searchActiveIndex + delta + searchMatches.length) % searchMatches.length;
+    searchActiveIndex = nextIndex;
+    scrollToSearchMatch(searchMatches[nextIndex], "smooth");
+  }
+
+  function scrollToSearchMatch(match: SearchMatch, behavior: ScrollBehavior) {
+    if (!viewport || !documentInfo || match.rects.length === 0) {
+      return;
+    }
+
+    const firstRect = match.rects[0];
+    const pageTop = pageTops[match.pageIndex] ?? 0;
+    const matchTop = pageTop + firstRect.top * displayZoom;
+    const matchBottom = pageTop + (firstRect.top + firstRect.height) * displayZoom;
+    const currentTop = viewport.scrollTop;
+    const currentBottom = currentTop + viewport.clientHeight;
+    if (matchTop >= currentTop + 48 && matchBottom <= currentBottom - 48) {
+      return;
+    }
+
+    viewport.scrollTo({
+      top: Math.max(0, matchTop - viewport.clientHeight * 0.32),
+      behavior,
+    });
+  }
+
+  function handleSearchInputKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearch();
+      viewport?.focus();
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      moveSearch(event.shiftKey ? -1 : 1);
+    }
   }
 
   function handleReaderPointerDown(event: PointerEvent) {
@@ -1328,6 +1563,9 @@
     </div>
 
     <div class="toolbar-group">
+      <button class="icon-button" class:active={searchOpen} title="Find in PDF" type="button" onclick={openSearch} disabled={!documentInfo}>
+        <SearchIcon size={18} />
+      </button>
       <button
         class="icon-button"
         class:active={settings?.layout.translationOpen}
@@ -1444,6 +1682,29 @@
         <div class="zoom-indicator">{Math.round(displayZoom * 100)}%</div>
       {/if}
 
+      {#if searchOpen}
+        <div class="find-popover">
+          <SearchIcon size={15} />
+          <input
+            bind:this={searchInputElement}
+            value={searchQuery}
+            placeholder="Find in PDF"
+            oninput={(event) => updateSearchQuery(event.currentTarget.value)}
+            onkeydown={handleSearchInputKeydown}
+          />
+          <span class="find-count">{searchStatusText}</span>
+          <button class="icon-button" title="Previous result" type="button" onclick={() => moveSearch(-1)} disabled={searchMatches.length === 0}>
+            <ChevronUp size={16} />
+          </button>
+          <button class="icon-button" title="Next result" type="button" onclick={() => moveSearch(1)} disabled={searchMatches.length === 0}>
+            <ChevronDown size={16} />
+          </button>
+          <button class="icon-button" title="Close search" type="button" onclick={closeSearch}>
+            <X size={16} />
+          </button>
+        </div>
+      {/if}
+
       <div
         bind:this={viewport}
         class="reader-viewport"
@@ -1472,6 +1733,23 @@
                   <img src={imageUrl} alt={`Page ${pageIndex + 1}`} draggable="false" />
                 {:else}
                   <div class="page-loading">Rendering</div>
+                {/if}
+
+                {#if rotation === 0 && searchMatchesByPage[pageIndex]?.length}
+                  <div class="search-highlight-layer" aria-hidden="true">
+                    {#each searchMatchesByPage[pageIndex] as match (match.id)}
+                      {#each match.rects as rect, rectIndex (`${match.id}-${rectIndex}`)}
+                        <div
+                          class="search-highlight"
+                          class:active={match.id === activeSearchMatchId}
+                          style:left={`${rect.left * displayZoom}px`}
+                          style:top={`${rect.top * displayZoom}px`}
+                          style:width={`${Math.max(1, rect.width * displayZoom)}px`}
+                          style:height={`${Math.max(1, rect.height * displayZoom)}px`}
+                        ></div>
+                      {/each}
+                    {/each}
+                  </div>
                 {/if}
 
                 {#if rotation === 0 && textLayers[pageIndex] && !isZooming}
@@ -1622,6 +1900,8 @@
     --accent-soft: rgba(79, 116, 104, 0.12);
     --accent-solid-text: #ffffff;
     --selection-bg: rgba(79, 116, 104, 0.24);
+    --search-bg: rgba(207, 168, 72, 0.24);
+    --search-active-bg: rgba(207, 118, 48, 0.42);
     --shadow: 0 18px 38px rgba(32, 31, 28, 0.12);
     --danger-bg: #fff4f0;
     --danger-border: #efb8aa;
@@ -1653,6 +1933,8 @@
     --accent-soft: rgba(156, 183, 168, 0.16);
     --accent-solid-text: #151515;
     --selection-bg: rgba(156, 183, 168, 0.27);
+    --search-bg: rgba(214, 185, 112, 0.26);
+    --search-active-bg: rgba(225, 145, 82, 0.46);
     --shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
     --danger-bg: #2b1d1b;
     --danger-border: #6d3a31;
@@ -1761,6 +2043,19 @@
     border-color: var(--accent);
     color: var(--accent);
     background: var(--accent-soft);
+  }
+
+  .icon-button:disabled,
+  .text-button:disabled {
+    cursor: default;
+    opacity: 0.42;
+  }
+
+  .icon-button:disabled:hover,
+  .text-button:disabled:hover {
+    border-color: var(--border);
+    color: var(--text);
+    background: var(--surface-raised);
   }
 
   .icon-button.primary {
@@ -1929,6 +2224,48 @@
     background: var(--reader-bg);
   }
 
+  .find-popover {
+    position: absolute;
+    top: 14px;
+    right: 18px;
+    z-index: 8;
+    display: grid;
+    grid-template-columns: auto minmax(180px, 260px) auto auto auto auto;
+    align-items: center;
+    gap: 7px;
+    box-sizing: border-box;
+    max-width: calc(100% - 36px);
+    padding: 7px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface-raised) 94%, transparent);
+    box-shadow: var(--shadow);
+    color: var(--muted);
+  }
+
+  .find-popover input {
+    height: 30px;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    padding: 0 4px;
+    color: var(--text);
+    outline: none;
+  }
+
+  .find-popover .icon-button {
+    width: 30px;
+    height: 30px;
+  }
+
+  .find-count {
+    min-width: 74px;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+    white-space: nowrap;
+  }
+
   .reader-viewport {
     position: absolute;
     inset: 0;
@@ -1951,6 +2288,25 @@
     position: absolute;
     border-radius: 2px;
     background: var(--selection-bg);
+  }
+
+  .search-highlight-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  .search-highlight {
+    position: absolute;
+    border-radius: 2px;
+    background: var(--search-bg);
+    mix-blend-mode: multiply;
+  }
+
+  .search-highlight.active {
+    background: var(--search-active-bg);
+    outline: 1px solid color-mix(in srgb, var(--search-active-bg) 70%, var(--text));
   }
 
   .pdf-page {
